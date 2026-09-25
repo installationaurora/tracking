@@ -1,87 +1,294 @@
-const REGISTRY_TTL_SECONDS = 15;
+const REGISTRY_KEY = process.env.PANDORA_REGISTRY_KEY;
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-function json(status, body) {
-  return {
-    status,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  };
+const HEARTBEAT_TTL = 15;
+const MARKER_TTL = 24 * 60 * 60;
+
+function json(value) {
+  return JSON.stringify(value);
 }
 
-async function redis(command, args = []) {
-  const base = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (!base || !token) {
-    throw new Error("Missing Upstash Redis environment variables");
+async function redisPipeline(commands) {
+  if (!REDIS_URL || !REDIS_TOKEN) {
+    throw new Error("Redis is not configured");
   }
 
-  const path = [command, ...args].map((part) => encodeURIComponent(String(part))).join("/");
-
-  const response = await fetch(`${base}/${path}`, {
+  const response = await fetch(`${REDIS_URL}/pipeline`, {
+    method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify(commands),
   });
 
   if (!response.ok) {
-    throw new Error(`Redis request failed: ${response.status}`);
+    throw new Error(`Redis HTTP ${response.status}`);
   }
 
-  return response.json();
+  const data = await response.json();
+  return data.map((item) => item?.result);
 }
 
-function registryKey(placeId, jobId) {
-  return `pandora:executors:${placeId}:${jobId}`;
+async function redis(command, ...args) {
+  const [result] = await redisPipeline([[command, ...args]]);
+  return result;
 }
 
-function validId(value) {
-  return typeof value === "string" || typeof value === "number";
+function validRequest(req) {
+  return (
+    req.headers["x-pandora-key"] === REGISTRY_KEY &&
+    !!REGISTRY_KEY
+  );
+}
+
+function cleanMarkers(markers, jobId, placeId) {
+  const now = Date.now();
+
+  return (Array.isArray(markers) ? markers : []).filter((marker) => {
+    return (
+      marker &&
+      String(marker.jobId) === String(jobId) &&
+      Number(marker.placeId) === Number(placeId) &&
+      Number(marker.createdAt) >
+        now - MARKER_TTL * 1000
+    );
+  });
 }
 
 export default async function handler(req, res) {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, X-Pandora-Key"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "POST, OPTIONS"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "POST required" });
+    return res.status(405).json({
+      error: "POST required",
+    });
   }
 
-  const suppliedKey = req.headers["x-pandora-key"];
-  if (!suppliedKey || suppliedKey !== process.env.PANDORA_REGISTRY_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+  if (!validRequest(req)) {
+    return res.status(401).json({
+      error: "Unauthorized",
+    });
   }
-
-  const body = req.body || {};
-  const { action, userId, jobId, placeId } = body;
-
-  if (!validId(jobId) || !validId(placeId)) {
-    return res.status(400).json({ error: "Missing placeId or jobId" });
-  }
-
-  const key = registryKey(placeId, jobId);
 
   try {
+    const body =
+      typeof req.body === "string"
+        ? JSON.parse(req.body)
+        : req.body || {};
+
+    const action = body.action;
+
+    // ==========================================
+    // EXECUTOR HEARTBEAT
+    // ==========================================
+
     if (action === "heartbeat") {
-      if (!validId(userId)) {
-        return res.status(400).json({ error: "Missing userId" });
+      const jobId = String(body.jobId || "");
+      const placeId = Number(body.placeId || 0);
+      const userId = String(body.userId || "");
+
+      if (!jobId || !userId || !placeId) {
+        return res.status(400).json({
+          error: "Missing heartbeat fields",
+        });
       }
 
-      await redis("sadd", [key, String(userId)]);
-      await redis("expire", [key, REGISTRY_TTL_SECONDS]);
+      const key = `pandora:executors:${placeId}:${jobId}`;
 
-      return res.status(200).json({ ok: true });
-    }
+      const record = json({
+        userId,
+        jobId,
+        placeId,
+        lastSeen: Date.now(),
+      });
 
-    if (action === "list") {
-      const result = await redis("smembers", [key]);
+      await redisPipeline([
+        ["HSET", key, userId, record],
+        ["EXPIRE", key, HEARTBEAT_TTL],
+      ]);
+
       return res.status(200).json({
-        users: Array.isArray(result.result) ? result.result : [],
+        ok: true,
       });
     }
 
-    return res.status(400).json({ error: "Unknown action" });
+    // ==========================================
+    // EXECUTOR LIST
+    // ==========================================
+
+    if (action === "list") {
+      const jobId = String(body.jobId || "");
+      const placeId = Number(body.placeId || 0);
+
+      if (!jobId || !placeId) {
+        return res.status(400).json({
+          error: "Missing list fields",
+        });
+      }
+
+      const key = `pandora:executors:${placeId}:${jobId}`;
+
+      const values = await redis("HVALS", key);
+
+      const now = Date.now();
+      const users = [];
+
+      for (const raw of Array.isArray(values) ? values : []) {
+        try {
+          const record = JSON.parse(raw);
+
+          if (
+            now - Number(record.lastSeen) <=
+            HEARTBEAT_TTL * 1000
+          ) {
+            users.push(String(record.userId));
+          }
+        } catch (_) {}
+      }
+
+      return res.status(200).json({
+        users,
+      });
+    }
+
+    // ==========================================
+    // ADD SHARED MARKER
+    // ==========================================
+
+    if (action === "marker_add") {
+      const jobId = String(body.jobId || "");
+      const placeId = Number(body.placeId || 0);
+      const userId = String(body.userId || "");
+      const markerName = String(body.markerName || "");
+      const position = body.position;
+
+      if (
+        !jobId ||
+        !placeId ||
+        !userId ||
+        !markerName ||
+        !position ||
+        typeof position.x !== "number" ||
+        typeof position.y !== "number" ||
+        typeof position.z !== "number"
+      ) {
+        return res.status(400).json({
+          error: "Missing marker fields",
+        });
+      }
+
+      const marker = {
+        id: String(
+          body.id || `${userId}-${Date.now()}`
+        ),
+
+        userId,
+
+        jobId,
+
+        placeId,
+
+        markerName,
+
+        position: {
+          x: position.x,
+          y: position.y,
+          z: position.z,
+        },
+
+        createdAt: Date.now(),
+      };
+
+      const key =
+        `pandora:markers:${placeId}:${jobId}`;
+
+      await redisPipeline([
+        ["LPUSH", key, json(marker)],
+        ["EXPIRE", key, MARKER_TTL],
+      ]);
+
+      return res.status(200).json({
+        ok: true,
+        marker,
+      });
+    }
+
+    // ==========================================
+    // GET SHARED MARKERS
+    // ==========================================
+
+    if (action === "marker_list") {
+      const jobId = String(body.jobId || "");
+      const placeId = Number(body.placeId || 0);
+
+      if (!jobId || !placeId) {
+        return res.status(400).json({
+          error: "Missing marker list fields",
+        });
+      }
+
+      const key =
+        `pandora:markers:${placeId}:${jobId}`;
+
+      const rawMarkers = await redis(
+        "LRANGE",
+        key,
+        "0",
+        "200"
+      );
+
+      const markers = [];
+
+      for (
+        const raw of Array.isArray(rawMarkers)
+          ? rawMarkers
+          : []
+      ) {
+        try {
+          const marker = JSON.parse(raw);
+
+          if (marker) {
+            markers.push(marker);
+          }
+        } catch (_) {}
+      }
+
+      return res.status(200).json({
+        markers: cleanMarkers(
+          markers,
+          jobId,
+          placeId
+        ),
+      });
+    }
+
+    // ==========================================
+    // UNKNOWN ACTION
+    // ==========================================
+
+    return res.status(400).json({
+      error: "Unknown action",
+    });
+
   } catch (error) {
-    console.error("Pandora registry error:", error);
-    return res.status(500).json({ error: "Registry unavailable" });
+    return res.status(500).json({
+      error: String(
+        error?.message || error
+      ),
+    });
   }
 }
