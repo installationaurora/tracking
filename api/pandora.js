@@ -3,7 +3,12 @@ const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 const HEARTBEAT_TTL = 15;
-const MARKER_TTL = 24 * 60 * 60;
+
+// Markers live for 30 seconds.
+const MARKER_TTL = 30;
+
+// Maximum markers each Pandora user can have at once.
+const MAX_MARKERS_PER_USER = 5;
 
 function json(value) {
   return JSON.stringify(value);
@@ -28,11 +33,15 @@ async function redisPipeline(commands) {
   }
 
   const data = await response.json();
+
   return data.map((item) => item?.result);
 }
 
 async function redis(command, ...args) {
-  const [result] = await redisPipeline([[command, ...args]]);
+  const [result] = await redisPipeline([
+    [command, ...args],
+  ]);
+
   return result;
 }
 
@@ -46,23 +55,43 @@ function validRequest(req) {
 function cleanMarkers(markers, jobId, placeId) {
   const now = Date.now();
 
-  return (Array.isArray(markers) ? markers : []).filter((marker) => {
-    return (
-      marker &&
-      String(marker.jobId) === String(jobId) &&
-      Number(marker.placeId) === Number(placeId) &&
-      Number(marker.createdAt) >
-        now - MARKER_TTL * 1000
-    );
-  });
+  return (Array.isArray(markers) ? markers : []).filter(
+    (marker) => {
+      if (!marker) {
+        return false;
+      }
+
+      if (String(marker.jobId) !== String(jobId)) {
+        return false;
+      }
+
+      if (Number(marker.placeId) !== Number(placeId)) {
+        return false;
+      }
+
+      if (
+        now - Number(marker.createdAt) >
+        MARKER_TTL * 1000
+      ) {
+        return false;
+      }
+
+      return true;
+    }
+  );
 }
 
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, X-Pandora-Key"
   );
+
   res.setHeader(
     "Access-Control-Allow-Methods",
     "POST, OPTIONS"
@@ -107,7 +136,8 @@ export default async function handler(req, res) {
         });
       }
 
-      const key = `pandora:executors:${placeId}:${jobId}`;
+      const key =
+        `pandora:executors:${placeId}:${jobId}`;
 
       const record = json({
         userId,
@@ -140,14 +170,22 @@ export default async function handler(req, res) {
         });
       }
 
-      const key = `pandora:executors:${placeId}:${jobId}`;
+      const key =
+        `pandora:executors:${placeId}:${jobId}`;
 
-      const values = await redis("HVALS", key);
+      const values = await redis(
+        "HVALS",
+        key
+      );
 
       const now = Date.now();
       const users = [];
 
-      for (const raw of Array.isArray(values) ? values : []) {
+      for (
+        const raw of Array.isArray(values)
+          ? values
+          : []
+      ) {
         try {
           const record = JSON.parse(raw);
 
@@ -173,7 +211,10 @@ export default async function handler(req, res) {
       const jobId = String(body.jobId || "");
       const placeId = Number(body.placeId || 0);
       const userId = String(body.userId || "");
-      const markerName = String(body.markerName || "");
+      const markerName = String(
+        body.markerName || ""
+      );
+
       const position = body.position;
 
       if (
@@ -191,9 +232,95 @@ export default async function handler(req, res) {
         });
       }
 
+      const key =
+        `pandora:markers:${placeId}:${jobId}`;
+
+      // Get existing markers.
+      const rawMarkers = await redis(
+        "LRANGE",
+        key,
+        "0",
+        "200"
+      );
+
+      const now = Date.now();
+
+      const existingMarkers = [];
+
+      for (
+        const raw of Array.isArray(rawMarkers)
+          ? rawMarkers
+          : []
+      ) {
+        try {
+          const marker = JSON.parse(raw);
+
+          if (!marker) {
+            continue;
+          }
+
+          // Remove expired markers.
+          if (
+            now -
+              Number(marker.createdAt) >
+              MARKER_TTL * 1000
+          ) {
+            continue;
+          }
+
+          // Make sure this marker belongs to
+          // this server.
+          if (
+            String(marker.jobId) !==
+              String(jobId) ||
+            Number(marker.placeId) !==
+              Number(placeId)
+          ) {
+            continue;
+          }
+
+          existingMarkers.push(marker);
+        } catch (_) {}
+      }
+
+      // ========================================
+      // MAX 5 MARKERS PER USER
+      // ========================================
+
+      const userMarkers =
+        existingMarkers.filter(
+          (marker) =>
+            String(marker.userId) ===
+            String(userId)
+        );
+
+      // If the user already has 5 markers,
+      // remove their oldest marker.
+      if (
+        userMarkers.length >=
+        MAX_MARKERS_PER_USER
+      ) {
+        userMarkers.sort(
+          (a, b) =>
+            Number(a.createdAt) -
+            Number(b.createdAt)
+        );
+
+        const oldest =
+          userMarkers[0];
+
+        await redis(
+          "LREM",
+          key,
+          "1",
+          json(oldest)
+        );
+      }
+
       const marker = {
         id: String(
-          body.id || `${userId}-${Date.now()}`
+          body.id ||
+            `${userId}-${Date.now()}`
         ),
 
         userId,
@@ -213,12 +340,20 @@ export default async function handler(req, res) {
         createdAt: Date.now(),
       };
 
-      const key =
-        `pandora:markers:${placeId}:${jobId}`;
-
+      // Add newest marker to the front.
       await redisPipeline([
-        ["LPUSH", key, json(marker)],
-        ["EXPIRE", key, MARKER_TTL],
+        [
+          "LPUSH",
+          key,
+          json(marker),
+        ],
+
+        // Keep Redis key alive.
+        [
+          "EXPIRE",
+          key,
+          MARKER_TTL,
+        ],
       ]);
 
       return res.status(200).json({
@@ -237,7 +372,8 @@ export default async function handler(req, res) {
 
       if (!jobId || !placeId) {
         return res.status(400).json({
-          error: "Missing marker list fields",
+          error:
+            "Missing marker list fields",
         });
       }
 
@@ -254,7 +390,9 @@ export default async function handler(req, res) {
       const markers = [];
 
       for (
-        const raw of Array.isArray(rawMarkers)
+        const raw of Array.isArray(
+          rawMarkers
+        )
           ? rawMarkers
           : []
       ) {
@@ -267,12 +405,14 @@ export default async function handler(req, res) {
         } catch (_) {}
       }
 
+      const cleaned = cleanMarkers(
+        markers,
+        jobId,
+        placeId
+      );
+
       return res.status(200).json({
-        markers: cleanMarkers(
-          markers,
-          jobId,
-          placeId
-        ),
+        markers: cleaned,
       });
     }
 
