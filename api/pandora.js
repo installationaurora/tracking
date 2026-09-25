@@ -3,12 +3,9 @@ const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 const HEARTBEAT_TTL = 15;
-
-// Markers live for 30 seconds.
 const MARKER_TTL = 30;
-
-// Maximum markers each Pandora user can have at once.
 const MAX_MARKERS_PER_USER = 5;
+const PLAYER_TARGET_TTL = 5 * 60;
 
 function json(value) {
   return JSON.stringify(value);
@@ -47,8 +44,8 @@ async function redis(command, ...args) {
 
 function validRequest(req) {
   return (
-    req.headers["x-pandora-key"] === REGISTRY_KEY &&
-    !!REGISTRY_KEY
+    !!REGISTRY_KEY &&
+    req.headers["x-pandora-key"] === REGISTRY_KEY
   );
 }
 
@@ -57,15 +54,17 @@ function cleanMarkers(markers, jobId, placeId) {
 
   return (Array.isArray(markers) ? markers : []).filter(
     (marker) => {
-      if (!marker) {
+      if (!marker) return false;
+
+      if (
+        String(marker.jobId) !== String(jobId)
+      ) {
         return false;
       }
 
-      if (String(marker.jobId) !== String(jobId)) {
-        return false;
-      }
-
-      if (Number(marker.placeId) !== Number(placeId)) {
+      if (
+        Number(marker.placeId) !== Number(placeId)
+      ) {
         return false;
       }
 
@@ -79,6 +78,45 @@ function cleanMarkers(markers, jobId, placeId) {
       return true;
     }
   );
+}
+
+function cleanPlayerTargets(targets, jobId, placeId) {
+  const now = Date.now();
+
+  return (
+    Array.isArray(targets) ? targets : []
+  ).filter((target) => {
+    if (!target) return false;
+
+    if (
+      String(target.jobId) !== String(jobId)
+    ) {
+      return false;
+    }
+
+    if (
+      Number(target.placeId) !== Number(placeId)
+    ) {
+      return false;
+    }
+
+    if (
+      now - Number(target.createdAt) >
+      PLAYER_TARGET_TTL * 1000
+    ) {
+      return false;
+    }
+
+    if (!target.sourceUserId) {
+      return false;
+    }
+
+    if (!target.targetUserId) {
+      return false;
+    }
+
+    return true;
+  });
 }
 
 export default async function handler(req, res) {
@@ -121,18 +159,33 @@ export default async function handler(req, res) {
 
     const action = body.action;
 
-    // ==========================================
-    // EXECUTOR HEARTBEAT
-    // ==========================================
+    /*
+     * ============================================================
+     * HEARTBEAT
+     * ============================================================
+     */
 
     if (action === "heartbeat") {
-      const jobId = String(body.jobId || "");
-      const placeId = Number(body.placeId || 0);
-      const userId = String(body.userId || "");
+      const jobId = String(
+        body.jobId || ""
+      );
 
-      if (!jobId || !userId || !placeId) {
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      const userId = String(
+        body.userId || ""
+      );
+
+      if (
+        !jobId ||
+        !userId ||
+        !placeId
+      ) {
         return res.status(400).json({
-          error: "Missing heartbeat fields",
+          error:
+            "Missing heartbeat fields",
         });
       }
 
@@ -147,8 +200,17 @@ export default async function handler(req, res) {
       });
 
       await redisPipeline([
-        ["HSET", key, userId, record],
-        ["EXPIRE", key, HEARTBEAT_TTL],
+        [
+          "HSET",
+          key,
+          userId,
+          record,
+        ],
+        [
+          "EXPIRE",
+          key,
+          HEARTBEAT_TTL,
+        ],
       ]);
 
       return res.status(200).json({
@@ -156,17 +218,28 @@ export default async function handler(req, res) {
       });
     }
 
-    // ==========================================
-    // EXECUTOR LIST
-    // ==========================================
+    /*
+     * ============================================================
+     * EXECUTOR LIST
+     * ============================================================
+     */
 
     if (action === "list") {
-      const jobId = String(body.jobId || "");
-      const placeId = Number(body.placeId || 0);
+      const jobId = String(
+        body.jobId || ""
+      );
 
-      if (!jobId || !placeId) {
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      if (
+        !jobId ||
+        !placeId
+      ) {
         return res.status(400).json({
-          error: "Missing list fields",
+          error:
+            "Missing list fields",
         });
       }
 
@@ -187,13 +260,17 @@ export default async function handler(req, res) {
           : []
       ) {
         try {
-          const record = JSON.parse(raw);
+          const record =
+            JSON.parse(raw);
 
           if (
-            now - Number(record.lastSeen) <=
+            now -
+              Number(record.lastSeen) <=
             HEARTBEAT_TTL * 1000
           ) {
-            users.push(String(record.userId));
+            users.push(
+              String(record.userId)
+            );
           }
         } catch (_) {}
       }
@@ -203,14 +280,25 @@ export default async function handler(req, res) {
       });
     }
 
-    // ==========================================
-    // ADD SHARED MARKER
-    // ==========================================
+    /*
+     * ============================================================
+     * MARKER ADD
+     * ============================================================
+     */
 
     if (action === "marker_add") {
-      const jobId = String(body.jobId || "");
-      const placeId = Number(body.placeId || 0);
-      const userId = String(body.userId || "");
+      const jobId = String(
+        body.jobId || ""
+      );
+
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      const userId = String(
+        body.userId || ""
+      );
+
       const markerName = String(
         body.markerName || ""
       );
@@ -228,14 +316,14 @@ export default async function handler(req, res) {
         typeof position.z !== "number"
       ) {
         return res.status(400).json({
-          error: "Missing marker fields",
+          error:
+            "Missing marker fields",
         });
       }
 
       const key =
         `pandora:markers:${placeId}:${jobId}`;
 
-      // Get existing markers.
       const rawMarkers = await redis(
         "LRANGE",
         key,
@@ -244,32 +332,31 @@ export default async function handler(req, res) {
       );
 
       const now = Date.now();
-
       const existingMarkers = [];
 
       for (
-        const raw of Array.isArray(rawMarkers)
+        const raw of Array.isArray(
+          rawMarkers
+        )
           ? rawMarkers
           : []
       ) {
         try {
-          const marker = JSON.parse(raw);
+          const marker =
+            JSON.parse(raw);
 
           if (!marker) {
             continue;
           }
 
-          // Remove expired markers.
           if (
             now -
               Number(marker.createdAt) >
-              MARKER_TTL * 1000
+            MARKER_TTL * 1000
           ) {
             continue;
           }
 
-          // Make sure this marker belongs to
-          // this server.
           if (
             String(marker.jobId) !==
               String(jobId) ||
@@ -279,23 +366,28 @@ export default async function handler(req, res) {
             continue;
           }
 
-          existingMarkers.push(marker);
+          existingMarkers.push(
+            marker
+          );
         } catch (_) {}
       }
-
-      // ========================================
-      // MAX 5 MARKERS PER USER
-      // ========================================
 
       const userMarkers =
         existingMarkers.filter(
           (marker) =>
-            String(marker.userId) ===
-            String(userId)
+            String(
+              marker.userId
+            ) === String(userId)
         );
 
-      // If the user already has 5 markers,
-      // remove their oldest marker.
+      /*
+       * Each user may have a maximum
+       * of five active markers.
+       *
+       * If they place a sixth,
+       * remove their oldest marker.
+       */
+
       if (
         userMarkers.length >=
         MAX_MARKERS_PER_USER
@@ -340,7 +432,6 @@ export default async function handler(req, res) {
         createdAt: Date.now(),
       };
 
-      // Add newest marker to the front.
       await redisPipeline([
         [
           "LPUSH",
@@ -348,7 +439,6 @@ export default async function handler(req, res) {
           json(marker),
         ],
 
-        // Keep Redis key alive.
         [
           "EXPIRE",
           key,
@@ -362,15 +452,25 @@ export default async function handler(req, res) {
       });
     }
 
-    // ==========================================
-    // GET SHARED MARKERS
-    // ==========================================
+    /*
+     * ============================================================
+     * MARKER LIST
+     * ============================================================
+     */
 
     if (action === "marker_list") {
-      const jobId = String(body.jobId || "");
-      const placeId = Number(body.placeId || 0);
+      const jobId = String(
+        body.jobId || ""
+      );
 
-      if (!jobId || !placeId) {
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      if (
+        !jobId ||
+        !placeId
+      ) {
         return res.status(400).json({
           error:
             "Missing marker list fields",
@@ -397,7 +497,8 @@ export default async function handler(req, res) {
           : []
       ) {
         try {
-          const marker = JSON.parse(raw);
+          const marker =
+            JSON.parse(raw);
 
           if (marker) {
             markers.push(marker);
@@ -405,20 +506,315 @@ export default async function handler(req, res) {
         } catch (_) {}
       }
 
-      const cleaned = cleanMarkers(
-        markers,
-        jobId,
-        placeId
-      );
+      const cleaned =
+        cleanMarkers(
+          markers,
+          jobId,
+          placeId
+        );
 
       return res.status(200).json({
         markers: cleaned,
       });
     }
 
-    // ==========================================
-    // UNKNOWN ACTION
-    // ==========================================
+    /*
+     * ============================================================
+     * PLAYER TARGET
+     *
+     * One target per Pandora user.
+     *
+     * Targets automatically expire after
+     * five minutes.
+     * ============================================================
+     */
+
+    if (action === "player_target") {
+      const jobId = String(
+        body.jobId || ""
+      );
+
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      const sourceUserId = String(
+        body.sourceUserId || ""
+      );
+
+      const targetUserId = String(
+        body.targetUserId || ""
+      );
+
+      if (
+        !jobId ||
+        !placeId ||
+        !sourceUserId ||
+        !targetUserId
+      ) {
+        return res.status(400).json({
+          error:
+            "Missing player target fields",
+        });
+      }
+
+      if (
+        sourceUserId ===
+        targetUserId
+      ) {
+        return res.status(400).json({
+          error:
+            "Cannot target yourself",
+        });
+      }
+
+      const key =
+        `pandora:player_targets:${placeId}:${jobId}`;
+
+      const rawTargets = await redis(
+        "LRANGE",
+        key,
+        "0",
+        "200"
+      );
+
+      const now = Date.now();
+
+      const existingTargets = [];
+
+      for (
+        const raw of Array.isArray(
+          rawTargets
+        )
+          ? rawTargets
+          : []
+      ) {
+        try {
+          const target =
+            JSON.parse(raw);
+
+          if (!target) {
+            continue;
+          }
+
+          if (
+            now -
+              Number(target.createdAt) >
+            PLAYER_TARGET_TTL * 1000
+          ) {
+            continue;
+          }
+
+          if (
+            String(target.jobId) !==
+              String(jobId) ||
+            Number(target.placeId) !==
+              Number(placeId)
+          ) {
+            continue;
+          }
+
+          existingTargets.push(
+            target
+          );
+        } catch (_) {}
+      }
+
+      /*
+       * Remove any previous target
+       * belonging to this Pandora user.
+       */
+
+      const oldTargets =
+        existingTargets.filter(
+          (target) =>
+            String(
+              target.sourceUserId
+            ) ===
+            String(sourceUserId)
+        );
+
+      const newTarget = {
+        id: String(
+          body.id ||
+            `${sourceUserId}-${Date.now()}`
+        ),
+
+        sourceUserId,
+
+        targetUserId,
+
+        jobId,
+
+        placeId,
+
+        createdAt: Date.now(),
+      };
+
+      /*
+       * Remove previous target(s)
+       * for this source user.
+       */
+
+      const commands = [];
+
+      for (
+        const oldTarget of oldTargets
+      ) {
+        commands.push([
+          "LREM",
+          key,
+          "1",
+          json(oldTarget),
+        ]);
+      }
+
+      /*
+       * Add the new target.
+       */
+
+      commands.push([
+        "LPUSH",
+        key,
+        json(newTarget),
+      ]);
+
+      commands.push([
+        "EXPIRE",
+        key,
+        PLAYER_TARGET_TTL,
+      ]);
+
+      await redisPipeline(
+        commands
+      );
+
+      return res.status(200).json({
+        ok: true,
+        target: newTarget,
+      });
+    }
+
+    /*
+     * ============================================================
+     * PLAYER TARGET LIST
+     * ============================================================
+     */
+
+    if (
+      action ===
+      "player_target_list"
+    ) {
+      const jobId = String(
+        body.jobId || ""
+      );
+
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      if (
+        !jobId ||
+        !placeId
+      ) {
+        return res.status(400).json({
+          error:
+            "Missing player target list fields",
+        });
+      }
+
+      const key =
+        `pandora:player_targets:${placeId}:${jobId}`;
+
+      const rawTargets = await redis(
+        "LRANGE",
+        key,
+        "0",
+        "200"
+      );
+
+      const targets = [];
+
+      for (
+        const raw of Array.isArray(
+          rawTargets
+        )
+          ? rawTargets
+          : []
+      ) {
+        try {
+          const target =
+            JSON.parse(raw);
+
+          if (target) {
+            targets.push(
+              target
+            );
+          }
+        } catch (_) {}
+      }
+
+      const cleaned =
+        cleanPlayerTargets(
+          targets,
+          jobId,
+          placeId
+        );
+
+      /*
+       * Remove expired targets
+       * from Redis when possible.
+       */
+
+      const expiredTargets =
+        targets.filter(
+          (target) =>
+            !cleaned.some(
+              (active) =>
+                String(
+                  active.id
+                ) ===
+                String(target.id)
+            )
+        );
+
+      if (
+        expiredTargets.length > 0
+      ) {
+        const cleanupCommands =
+          [];
+
+        for (
+          const expired of
+            expiredTargets
+        ) {
+          cleanupCommands.push([
+            "LREM",
+            key,
+            "1",
+            json(expired),
+          ]);
+        }
+
+        if (
+          cleanupCommands.length
+        ) {
+          await redisPipeline(
+            cleanupCommands
+          );
+        }
+      }
+
+      return res.status(200).json({
+        targets: cleaned,
+      });
+    }
+
+    /*
+     * ============================================================
+     * UNKNOWN ACTION
+     * ============================================================
+     */
 
     return res.status(400).json({
       error: "Unknown action",
