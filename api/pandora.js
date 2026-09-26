@@ -501,7 +501,9 @@ export default async function handler(req, res) {
             JSON.parse(raw);
 
           if (marker) {
-            markers.push(marker);
+            markers.push(
+              marker
+            );
           }
         } catch (_) {}
       }
@@ -692,6 +694,117 @@ export default async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         target: newTarget,
+      });
+    }
+
+    /*
+     * ============================================================
+     * PLAYER TARGET REMOVE
+     *
+     * Removes the current target belonging
+     * to one Pandora user.
+     *
+     * If targetUserId is supplied, only
+     * that specific target is removed.
+     * ============================================================
+     */
+
+    if (
+      action ===
+      "player_target_remove"
+    ) {
+      const jobId = String(
+        body.jobId || ""
+      );
+
+      const placeId = Number(
+        body.placeId || 0
+      );
+
+      const sourceUserId = String(
+        body.sourceUserId || ""
+      );
+
+      const targetUserId =
+        body.targetUserId
+          ? String(
+              body.targetUserId
+            )
+          : "";
+
+      if (
+        !jobId ||
+        !placeId ||
+        !sourceUserId
+      ) {
+        return res.status(400).json({
+          error:
+            "Missing player target remove fields",
+        });
+      }
+
+      const key =
+        `pandora:player_targets:${placeId}:${jobId}`;
+
+      const rawTargets = await redis(
+        "LRANGE",
+        key,
+        "0",
+        "200"
+      );
+
+      const commands = [];
+
+      for (
+        const raw of Array.isArray(
+          rawTargets
+        )
+          ? rawTargets
+          : []
+      ) {
+        try {
+          const target =
+            JSON.parse(raw);
+
+          if (!target) {
+            continue;
+          }
+
+          const sameSource =
+            String(
+              target.sourceUserId
+            ) === sourceUserId;
+
+          const sameTarget =
+            !targetUserId ||
+            String(
+              target.targetUserId
+            ) === targetUserId;
+
+          if (
+            sameSource &&
+            sameTarget
+          ) {
+            commands.push([
+              "LREM",
+              key,
+              "1",
+              json(target),
+            ]);
+          }
+        } catch (_) {}
+      }
+
+      if (
+        commands.length > 0
+      ) {
+        await redisPipeline(
+          commands
+        );
+      }
+
+      return res.status(200).json({
+        ok: true,
       });
     }
 
